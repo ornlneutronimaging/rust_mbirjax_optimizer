@@ -1,0 +1,532 @@
+//! The optimizer UI: pick two slices on the projection view, run a test
+//! MBIRJAX reconstruction of those two slices, tune the parameters, repeat —
+//! then save the parameters into the checkpoint HDF5.
+
+use crate::recon::{ReconJob, MbirjaxParams, save_params};
+use ct_reconstruction::combine::{LoadJob, LoadedStack};
+use egui::{Color32, RichText};
+use sha2::{Digest, Sha256};
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::time::Duration;
+
+/// SHA-256 of the advanced-parameters password (same gate as the marimo
+/// notebook and the main application's admin section).
+const ADVANCED_PASSWORD_SHA256: &str =
+    "b8b22aedc372aa891df895be9a7626e6d9ddc6d39ba85d202ca68de8c52ad782";
+
+fn password_matches(input: &str) -> bool {
+    let digest = Sha256::digest(input.as_bytes());
+    let hex: String = digest.iter().map(|b| format!("{b:02x}")).collect();
+    hex == ADVANCED_PASSWORD_SHA256
+}
+
+/// One entry of the run history.
+struct HistoryEntry {
+    params: MbirjaxParams,
+    top_slice: usize,
+    bottom_slice: usize,
+    seconds: f64,
+}
+
+pub struct OptimizerApp {
+    called_from_app: bool,
+
+    stack: Option<Arc<LoadedStack>>,
+    load_job: Option<LoadJob>,
+    load_error: Option<String>,
+
+    // Slice selection on the projection view.
+    top_slice: usize,
+    bottom_slice: usize,
+    preview_frame: usize,
+    preview_tex: Option<((usize, usize), egui::TextureHandle)>,
+
+    // Parameters.
+    params: MbirjaxParams,
+    advanced_unlocked: bool,
+    advanced_password: String,
+    advanced_error: Option<String>,
+
+    // Test reconstruction.
+    recon_job: Option<ReconJob>,
+    /// Last result: (height, width, top slice, bottom slice, seconds).
+    result: Option<(usize, usize, Vec<f32>, Vec<f32>, f64)>,
+    result_tex: Option<(egui::TextureHandle, egui::TextureHandle)>,
+    recon_error: Option<String>,
+    history: Vec<HistoryEntry>,
+
+    // Saving into the HDF5.
+    save_status: Option<Result<String, String>>,
+
+    status: String,
+}
+
+impl OptimizerApp {
+    pub fn new(input: Option<PathBuf>, called_from_app: bool) -> Self {
+        let mut app = Self {
+            called_from_app,
+            stack: None,
+            load_job: None,
+            load_error: None,
+            top_slice: 0,
+            bottom_slice: 0,
+            preview_frame: 0,
+            preview_tex: None,
+            params: MbirjaxParams::default(),
+            advanced_unlocked: false,
+            advanced_password: String::new(),
+            advanced_error: None,
+            recon_job: None,
+            result: None,
+            result_tex: None,
+            recon_error: None,
+            history: Vec::new(),
+            save_status: None,
+            status: "Open a pre-processed checkpoint HDF5 to begin.".to_owned(),
+        };
+        if let Some(path) = input {
+            app.start_load(path);
+        }
+        app
+    }
+
+    fn start_load(&mut self, path: PathBuf) {
+        self.status = format!("Loading {}…", path.display());
+        self.load_error = None;
+        self.load_job = Some(LoadJob::start(path));
+    }
+
+    fn adopt_stack(&mut self, stack: LoadedStack) {
+        let h = stack.sample.first().map(|p| p.height).unwrap_or(1);
+        self.top_slice = h / 3;
+        self.bottom_slice = (2 * h) / 3;
+        self.preview_frame = 0;
+        self.preview_tex = None;
+        self.result = None;
+        self.result_tex = None;
+        self.history.clear();
+        self.save_status = None;
+        self.params = MbirjaxParams::from_stack(&stack);
+        let restored = stack
+            .metadata
+            .iter()
+            .any(|(name, _)| name == "mbirjax_config");
+        self.status = format!(
+            "{} — {} projections{}",
+            stack.path.display(),
+            stack.sample.len(),
+            if restored {
+                " — saved MBIRJAX parameters restored"
+            } else {
+                ""
+            }
+        );
+        self.stack = Some(Arc::new(stack));
+    }
+
+    fn grayscale_texture(
+        ctx: &egui::Context,
+        name: &str,
+        values: &[f32],
+        w: usize,
+        h: usize,
+    ) -> egui::TextureHandle {
+        let (mut lo, mut hi) = (f32::MAX, f32::MIN);
+        for v in values {
+            lo = lo.min(*v);
+            hi = hi.max(*v);
+        }
+        let span = (hi - lo).max(1e-6);
+        let pixels: Vec<Color32> = values
+            .iter()
+            .map(|v| Color32::from_gray((((v - lo) / span) * 255.0) as u8))
+            .collect();
+        ctx.load_texture(
+            name.to_owned(),
+            egui::ColorImage {
+                size: [w, h],
+                source_size: egui::vec2(w as f32, h as f32),
+                pixels,
+            },
+            egui::TextureOptions::LINEAR,
+        )
+    }
+
+    fn projection_panel(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        let Some(stack) = self.stack.clone() else {
+            return;
+        };
+        let Some(first) = stack.sample.first() else {
+            return;
+        };
+        let (w, h, n) = (first.width, first.height, stack.sample.len());
+        ui.label(RichText::new("Slice selection").strong());
+        self.preview_frame = self.preview_frame.min(n - 1);
+        ui.horizontal(|ui| {
+            ui.add(egui::Slider::new(&mut self.preview_frame, 0..=n - 1).text("projection"));
+            let p = &stack.sample[self.preview_frame];
+            ui.label(
+                RichText::new(match p.angle_deg {
+                    Some(a) => format!("{a:.2}°"),
+                    None => String::new(),
+                })
+                .weak()
+                .size(11.0),
+            );
+        });
+        ui.add(egui::Slider::new(&mut self.top_slice, 0..=h - 1).text("top slice (red)"));
+        ui.add(
+            egui::Slider::new(&mut self.bottom_slice, 0..=h - 1).text("bottom slice (cyan)"),
+        );
+
+        let key = (Arc::as_ptr(&stack) as usize, self.preview_frame);
+        if self.preview_tex.as_ref().map(|(k, _)| *k) != Some(key) {
+            let p = &stack.sample[self.preview_frame];
+            let stride = (p.width.max(p.height) / 512).max(1);
+            let (sw, sh) = (p.width.div_ceil(stride), p.height.div_ceil(stride));
+            let mut small = Vec::with_capacity(sw * sh);
+            for y in (0..p.height).step_by(stride) {
+                for x in (0..p.width).step_by(stride) {
+                    small.push(p.mean[y * p.width + x]);
+                }
+            }
+            let tex = Self::grayscale_texture(ctx, "projection", &small, sw, sh);
+            self.preview_tex = Some((key, tex));
+        }
+        if let Some((_, tex)) = &self.preview_tex {
+            let size = tex.size_vec2();
+            let scale = (420.0 / size.x.max(size.y)).min(2.0);
+            let response =
+                ui.add(egui::Image::from_texture(tex).fit_to_exact_size(size * scale));
+            let rect = response.rect;
+            let painter = ui.painter_at(rect);
+            let y_of =
+                |row: usize| rect.top() + (row as f32 / h as f32) * rect.height();
+            for (row, color) in [
+                (self.top_slice, Color32::from_rgb(255, 90, 80)),
+                (self.bottom_slice, Color32::from_rgb(110, 230, 230)),
+            ] {
+                painter.line_segment(
+                    [
+                        egui::pos2(rect.left(), y_of(row)),
+                        egui::pos2(rect.right(), y_of(row)),
+                    ],
+                    egui::Stroke::new(1.5, color),
+                );
+            }
+            let _ = w;
+        }
+        ui.label(
+            RichText::new(
+                "the test reconstruction runs on the two marked slices only (a 4-slice \
+                 band around each)",
+            )
+            .weak()
+            .size(11.0),
+        );
+    }
+
+    fn params_panel(&mut self, ui: &mut egui::Ui) {
+        ui.label(RichText::new("MBIRJAX parameters").strong());
+        ui.add(
+            egui::Slider::new(&mut self.params.sharpness, -1.0..=3.0)
+                .step_by(0.1)
+                .text("sharpness"),
+        )
+        .on_hover_text(
+            "larger (positive) values produce sharper, more detailed images; smaller \
+             (negative) values produce smoother images",
+        );
+
+        egui::CollapsingHeader::new(RichText::new("🔒 Advanced").strong())
+            .default_open(false)
+            .show(ui, |ui| {
+                if !self.advanced_unlocked {
+                    ui.horizontal(|ui| {
+                        ui.label("Password:");
+                        let edit = ui.add(
+                            egui::TextEdit::singleline(&mut self.advanced_password)
+                                .password(true)
+                                .desired_width(140.0),
+                        );
+                        let entered =
+                            edit.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                        if ui.button("Unlock").clicked() || entered {
+                            if password_matches(&self.advanced_password) {
+                                self.advanced_unlocked = true;
+                                self.advanced_error = None;
+                            } else {
+                                self.advanced_error = Some("wrong password".to_owned());
+                            }
+                            self.advanced_password.clear();
+                        }
+                    });
+                    if let Some(e) = &self.advanced_error {
+                        ui.colored_label(Color32::LIGHT_RED, e);
+                    }
+                    return;
+                }
+                ui.add(
+                    egui::Slider::new(&mut self.params.snr_db, 25.0..=35.0)
+                        .text("signal noise ratio (dB)"),
+                )
+                .on_hover_text(
+                    "assumed signal-to-noise ratio of the data; larger values yield \
+                     sharper reconstructions but can amplify noise",
+                );
+                ui.add(
+                    egui::Slider::new(&mut self.params.max_iterations, 10..=25)
+                        .text("maximum iterations"),
+                )
+                .on_hover_text(
+                    "more iterations improve convergence but increase the reconstruction time",
+                );
+                ui.add(
+                    egui::Slider::new(&mut self.params.scale, 0.5..=2.0)
+                        .step_by(0.1)
+                        .text("reconstruction scale"),
+                )
+                .on_hover_text(
+                    "scales the reconstruction grid (row and column together); 1.0 keeps \
+                     the detector size",
+                );
+                ui.checkbox(&mut self.params.positivity, "positivity")
+                    .on_hover_text("all reconstructed voxel values are forced to be >= 0");
+                let width = self
+                    .stack
+                    .as_ref()
+                    .and_then(|s| s.sample.first())
+                    .map(|p| p.width as f64)
+                    .unwrap_or(512.0);
+                ui.horizontal(|ui| {
+                    ui.label("center of rotation offset from center:");
+                    ui.add(
+                        egui::DragValue::new(&mut self.params.det_channel_offset)
+                            .speed(0.01)
+                            .range(-width / 2.0..=width / 2.0),
+                    )
+                    .on_hover_text(
+                        "offset of the center of rotation from the center of the detector \
+                         image, in pixels; positive values shift it to the right",
+                    );
+                });
+            });
+    }
+
+    fn results_panel(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        if let Some(job) = &mut self.recon_job {
+            match job.poll() {
+                Some(Ok((rh, rw, top, bottom, seconds))) => {
+                    self.history.push(HistoryEntry {
+                        params: self.params,
+                        top_slice: self.top_slice,
+                        bottom_slice: self.bottom_slice,
+                        seconds,
+                    });
+                    self.result_tex = Some((
+                        Self::grayscale_texture(ctx, "recon_top", &top, rw, rh),
+                        Self::grayscale_texture(ctx, "recon_bottom", &bottom, rw, rh),
+                    ));
+                    self.result = Some((rh, rw, top, bottom, seconds));
+                    self.recon_error = None;
+                    self.recon_job = None;
+                    self.status = format!("Reconstruction done in {seconds:.1} s.");
+                }
+                Some(Err(e)) => {
+                    self.recon_error = Some(e);
+                    self.recon_job = None;
+                    self.status = "Reconstruction failed.".to_owned();
+                }
+                None => {
+                    ui.horizontal(|ui| {
+                        ui.spinner();
+                        ui.label("mbirjax is reconstructing the two test slices…");
+                    });
+                    ctx.request_repaint_after(Duration::from_millis(300));
+                }
+            }
+        }
+
+        let busy = self.recon_job.is_some();
+        ui.horizontal(|ui| {
+            if ui
+                .add_enabled(
+                    self.stack.is_some() && !busy,
+                    egui::Button::new("▶ Evaluate the reconstruction of the selected slices"),
+                )
+                .clicked()
+            {
+                let stack = self.stack.clone().expect("checked above");
+                self.recon_error = None;
+                self.status = "Running mbirjax…".to_owned();
+                self.recon_job = Some(ReconJob::start(
+                    stack,
+                    self.top_slice,
+                    self.bottom_slice,
+                    self.params,
+                ));
+            }
+            if ui
+                .add_enabled(
+                    self.stack.is_some() && !busy,
+                    egui::Button::new("💾 Save the parameters into the HDF5"),
+                )
+                .on_hover_text(
+                    "writes mbirjax_config into the checkpoint so later reconstructions \
+                     use these parameters",
+                )
+                .clicked()
+            {
+                let path = self.stack.as_ref().expect("checked").path.clone();
+                let result = save_params(&path, &self.params).map(|()| {
+                    format!("mbirjax_config saved into {}", path.display())
+                });
+                if result.is_ok() && self.called_from_app {
+                    println!("{}", self.params.to_json());
+                }
+                self.save_status = Some(result);
+            }
+        });
+        match &self.save_status {
+            Some(Ok(msg)) => {
+                ui.colored_label(Color32::from_rgb(120, 200, 120), msg);
+            }
+            Some(Err(e)) => {
+                ui.colored_label(Color32::LIGHT_RED, e);
+            }
+            None => {}
+        }
+        if let Some(e) = &self.recon_error {
+            ui.colored_label(Color32::LIGHT_RED, e);
+        }
+
+        if let (Some((rh, rw, .., seconds)), Some((top_tex, bottom_tex))) =
+            (&self.result, &self.result_tex)
+        {
+            ui.label(
+                RichText::new(format!(
+                    "reconstructed {rh}x{rw} slices in {seconds:.1} s — {}",
+                    self.params.describe()
+                ))
+                .strong(),
+            );
+            ui.columns(2, |cols| {
+                for (col, tex, label, row) in [
+                    (0usize, top_tex, "top slice", self.top_slice),
+                    (1, bottom_tex, "bottom slice", self.bottom_slice),
+                ] {
+                    let ui = &mut cols[col];
+                    ui.label(
+                        RichText::new(format!("{label} (row {row})"))
+                            .strong()
+                            .size(13.0),
+                    );
+                    let size = tex.size_vec2();
+                    let width = (ui.available_width() - 12.0).clamp(200.0, 460.0);
+                    ui.add(
+                        egui::Image::from_texture(tex)
+                            .fit_to_exact_size(egui::vec2(width, width * size.y / size.x)),
+                    );
+                }
+            });
+        }
+
+        if !self.history.is_empty() {
+            ui.add_space(6.0);
+            egui::CollapsingHeader::new(RichText::new("Run history").strong())
+                .default_open(false)
+                .show(ui, |ui| {
+                    let mut restore = None;
+                    for (i, entry) in self.history.iter().enumerate().rev() {
+                        ui.horizontal(|ui| {
+                            if ui.button("use").clicked() {
+                                restore = Some(entry.params);
+                            }
+                            ui.label(
+                                RichText::new(format!(
+                                    "#{} — rows {}/{} — {} — {:.1} s",
+                                    i + 1,
+                                    entry.top_slice,
+                                    entry.bottom_slice,
+                                    entry.params.describe(),
+                                    entry.seconds
+                                ))
+                                .size(12.0),
+                            );
+                        });
+                    }
+                    if let Some(params) = restore {
+                        self.params = params;
+                    }
+                });
+        }
+    }
+}
+
+impl eframe::App for OptimizerApp {
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        let ctx = ui.ctx().clone();
+        if let Some(job) = &mut self.load_job {
+            match job.poll() {
+                Some(Ok(stack)) => {
+                    self.adopt_stack(stack);
+                    self.load_job = None;
+                }
+                Some(Err(e)) => {
+                    self.load_error = Some(e);
+                    self.load_job = None;
+                    self.status = "Loading failed.".to_owned();
+                }
+                None => ctx.request_repaint_after(Duration::from_millis(300)),
+            }
+        }
+
+        egui::Panel::top("toolbar").show(ui, |ui| {
+            ui.horizontal(|ui| {
+                if ui.button("📂 Open a checkpoint HDF5…").clicked() {
+                    let mut dialog = rfd::FileDialog::new()
+                        .set_title("Select a pre-processed checkpoint HDF5")
+                        .add_filter("HDF5", &["h5", "hdf5"]);
+                    if let Some(dir) = self
+                        .stack
+                        .as_ref()
+                        .and_then(|s| s.path.parent())
+                        .filter(|p| p.is_dir())
+                    {
+                        dialog = dialog.set_directory(dir);
+                    }
+                    if let Some(path) = dialog.pick_file() {
+                        self.start_load(path);
+                    }
+                }
+                ui.label(RichText::new(&self.status).weak());
+            });
+        });
+        egui::CentralPanel::default().show(ui, |ui| {
+            if self.load_job.is_some() {
+                ui.horizontal(|ui| {
+                    ui.spinner();
+                    ui.label("loading the stack…");
+                });
+                return;
+            }
+            if let Some(e) = &self.load_error {
+                ui.colored_label(Color32::LIGHT_RED, e);
+            }
+            if self.stack.is_none() {
+                return;
+            }
+            egui::ScrollArea::vertical()
+                .auto_shrink([false, false])
+                .show(ui, |ui| {
+                    ui.columns(2, |cols| {
+                        self.projection_panel(&mut cols[0], &ctx);
+                        self.params_panel(&mut cols[1]);
+                    });
+                    ui.separator();
+                    self.results_panel(ui, &ctx);
+                });
+        });
+    }
+}

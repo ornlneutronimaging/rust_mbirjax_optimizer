@@ -28,7 +28,7 @@ from the checkpoint.
 
 Note: every evaluation starts a fresh Python process, so JAX recompiles its
 kernels each run — expect a couple of minutes of fixed overhead on top of
-the reconstruction itself.
+the reconstruction itself (which runs on the node's GPUs when available).
 
 ## Running
 

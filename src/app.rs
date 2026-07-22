@@ -27,6 +27,12 @@ struct HistoryEntry {
     top_slice: usize,
     bottom_slice: usize,
     seconds: f64,
+    /// Downsampled copies of the two reconstructed slices, kept so past runs
+    /// can be previewed side by side when choosing the parameters.
+    thumb_size: (usize, usize),
+    top_thumb: Vec<f32>,
+    bottom_thumb: Vec<f32>,
+    tex: Option<(egui::TextureHandle, egui::TextureHandle)>,
 }
 
 pub struct OptimizerApp {
@@ -125,6 +131,19 @@ impl OptimizerApp {
         self.stack = Some(Arc::new(stack));
     }
 
+    /// Stride-downsample a w×h image so its longest side is at most `max`.
+    fn downsample(values: &[f32], w: usize, h: usize, max: usize) -> (Vec<f32>, usize, usize) {
+        let stride = (w.max(h) / max).max(1);
+        let (sw, sh) = (w.div_ceil(stride), h.div_ceil(stride));
+        let mut small = Vec::with_capacity(sw * sh);
+        for y in (0..h).step_by(stride) {
+            for x in (0..w).step_by(stride) {
+                small.push(values[y * w + x]);
+            }
+        }
+        (small, sw, sh)
+    }
+
     fn grayscale_texture(
         ctx: &egui::Context,
         name: &str,
@@ -183,14 +202,7 @@ impl OptimizerApp {
         let key = (Arc::as_ptr(&stack) as usize, self.preview_frame);
         if self.preview_tex.as_ref().map(|(k, _)| *k) != Some(key) {
             let p = &stack.sample[self.preview_frame];
-            let stride = (p.width.max(p.height) / 512).max(1);
-            let (sw, sh) = (p.width.div_ceil(stride), p.height.div_ceil(stride));
-            let mut small = Vec::with_capacity(sw * sh);
-            for y in (0..p.height).step_by(stride) {
-                for x in (0..p.width).step_by(stride) {
-                    small.push(p.mean[y * p.width + x]);
-                }
-            }
+            let (small, sw, sh) = Self::downsample(&p.mean, p.width, p.height, 512);
             let tex = Self::grayscale_texture(ctx, "projection", &small, sw, sh);
             self.preview_tex = Some((key, tex));
         }
@@ -318,11 +330,17 @@ impl OptimizerApp {
         if let Some(job) = &mut self.recon_job {
             match job.poll() {
                 Some(Ok((rh, rw, top, bottom, seconds))) => {
+                    let (top_thumb, tw, th) = Self::downsample(&top, rw, rh, 512);
+                    let (bottom_thumb, ..) = Self::downsample(&bottom, rw, rh, 512);
                     self.history.push(HistoryEntry {
                         params: self.params,
                         top_slice: self.top_slice,
                         bottom_slice: self.bottom_slice,
                         seconds,
+                        thumb_size: (tw, th),
+                        top_thumb,
+                        bottom_thumb,
+                        tex: None,
                     });
                     self.result_tex = Some((
                         Self::grayscale_texture(ctx, "recon_top", &top, rw, rh),
@@ -438,10 +456,48 @@ impl OptimizerApp {
                 .default_open(false)
                 .show(ui, |ui| {
                     let mut restore = None;
-                    for (i, entry) in self.history.iter().enumerate().rev() {
+                    for (i, entry) in self.history.iter_mut().enumerate().rev() {
+                        let (tw, th) = entry.thumb_size;
+                        let (top_tex, bottom_tex) = entry.tex.get_or_insert_with(|| {
+                            (
+                                Self::grayscale_texture(
+                                    ctx,
+                                    &format!("hist_top_{i}"),
+                                    &entry.top_thumb,
+                                    tw,
+                                    th,
+                                ),
+                                Self::grayscale_texture(
+                                    ctx,
+                                    &format!("hist_bottom_{i}"),
+                                    &entry.bottom_thumb,
+                                    tw,
+                                    th,
+                                ),
+                            )
+                        });
                         ui.horizontal(|ui| {
                             if ui.button("use").clicked() {
                                 restore = Some(entry.params);
+                            }
+                            for (tex, which) in
+                                [(&*top_tex, "top"), (&*bottom_tex, "bottom")]
+                            {
+                                let size = tex.size_vec2();
+                                let thumb_h = 96.0;
+                                ui.add(egui::Image::from_texture(tex).fit_to_exact_size(
+                                    egui::vec2(thumb_h * size.x / size.y, thumb_h),
+                                ))
+                                .on_hover_ui(|ui| {
+                                    ui.label(
+                                        RichText::new(format!("#{} — {which} slice", i + 1))
+                                            .strong(),
+                                    );
+                                    let big = 420.0;
+                                    ui.add(egui::Image::from_texture(tex).fit_to_exact_size(
+                                        egui::vec2(big, big * size.y / size.x),
+                                    ));
+                                });
                             }
                             ui.label(
                                 RichText::new(format!(

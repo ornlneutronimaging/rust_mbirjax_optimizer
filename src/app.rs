@@ -531,6 +531,10 @@ impl OptimizerApp {
 }
 
 impl eframe::App for OptimizerApp {
+    fn on_exit(&mut self) {
+        crate::recon::kill_running();
+    }
+
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         if let Some(job) = &mut self.load_job {

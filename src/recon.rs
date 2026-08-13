@@ -5,8 +5,8 @@
 use ct_reconstruction::combine::LoadedStack;
 use ct_reconstruction::crop::{read_npy, write_npy};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::mpsc::{Receiver, channel};
+use std::sync::{Arc, Mutex};
 
 /// The interpreter of the pixi environment that has mbirjax installed.
 pub const MBIRJAX_PYTHON: &str =
@@ -197,6 +197,36 @@ fn scratch_dir(stack: &LoadedStack) -> Result<PathBuf, String> {
     Ok(dir)
 }
 
+/// PID of the mbirjax subprocess currently running, so it can be killed
+/// when the application quits instead of finishing orphaned on the GPU.
+static RUNNING_PID: Mutex<Option<u32>> = Mutex::new(None);
+
+fn set_running(pid: Option<u32>) {
+    if let Ok(mut guard) = RUNNING_PID.lock() {
+        *guard = pid;
+    }
+}
+
+/// Kill the mbirjax subprocess still running, if any (called on quit).
+pub fn kill_running() {
+    let pid = RUNNING_PID.lock().ok().and_then(|guard| *guard);
+    if let Some(pid) = pid {
+        let _ = std::process::Command::new("kill")
+            .args(["-9", &pid.to_string()])
+            .status();
+    }
+}
+
+/// The one GPU the test reconstruction may use: the first of an
+/// already-restricted `CUDA_VISIBLE_DEVICES`, or GPU 0.
+fn single_gpu() -> String {
+    std::env::var("CUDA_VISIBLE_DEVICES")
+        .ok()
+        .and_then(|v| v.split(',').next().map(|d| d.trim().to_string()))
+        .filter(|d| !d.is_empty())
+        .unwrap_or_else(|| "0".to_string())
+}
+
 fn run_recon(
     stack: &LoadedStack,
     top_slice: usize,
@@ -252,13 +282,21 @@ fn run_recon(
             .map_err(|e| format!("write {}: {e}", spec_file.display()))?;
         std::fs::write(&script, MBIRJAX_SCRIPT)
             .map_err(|e| format!("write {}: {e}", script.display()))?;
-        let output = std::process::Command::new(MBIRJAX_PYTHON)
+        let child = std::process::Command::new(MBIRJAX_PYTHON)
             .arg(&script)
             .arg(&sino_npy)
             .arg(&spec_file)
             .arg(&out_npy)
-            .output()
+            // The test bands are tiny; keep JAX off the machine's other GPUs.
+            .env("CUDA_VISIBLE_DEVICES", single_gpu())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
             .map_err(|e| format!("cannot launch {MBIRJAX_PYTHON}: {e}"))?;
+        set_running(Some(child.id()));
+        let output = child.wait_with_output();
+        set_running(None);
+        let output = output.map_err(|e| format!("mbirjax: {e}"))?;
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
             let tail: Vec<&str> = stderr.trim().lines().rev().take(4).collect();

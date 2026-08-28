@@ -586,6 +586,7 @@ impl eframe::App for OptimizerApp {
                     }
                     ui.separator();
                     crate::theme::toggle_button(ui);
+                    crate::zoom::toggle_button(ui);
                 });
             });
         });

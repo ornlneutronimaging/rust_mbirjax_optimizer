@@ -62,7 +62,7 @@ fn tilt_summary_lines(stack: &LoadedStack) -> Vec<String> {
         let get = |key: &str| doc.get(key).and_then(|v| v.as_f64());
         let text = |key: &str| doc.get(key).and_then(|v| v.as_str()).unwrap_or("");
         lines.push(format!(
-            "tilt & center-of-rotation tool: tilt {:+.4}° corrected, center of rotation              {:.2} px ({}{}{})",
+            "tilt & center-of-rotation tool: tilt {:+.4}° corrected, center of rotation {:.2} px ({}{}{})",
             get("corrected_tilt_deg").unwrap_or(0.0),
             get("center_of_rotation").unwrap_or(0.0),
             text("method"),

@@ -253,7 +253,7 @@ impl OptimizerApp {
         {
             self.params.det_channel_offset = offset_from_center(cor, w);
             note = format!(
-                " — center of rotation offset re-seeded from the corrected file                  ({cor:.2} px); save the parameters to keep it"
+                " — center of rotation offset re-seeded from the corrected file ({cor:.2} px); save the parameters to keep it"
             );
         }
         self.status = format!(

@@ -2,13 +2,76 @@
 //! MBIRJAX reconstruction of those two slices, tune the parameters, repeat —
 //! then save the parameters into the checkpoint HDF5.
 
-use crate::recon::{ReconJob, MbirjaxParams, save_params};
+use crate::recon::{
+    BAND, MbirjaxParams, ReconJob, TEST_REBIN_FACTORS, center_from_offset, checkpoint_geometry,
+    max_test_rebin, offset_from_center, save_params, test_band_fits, tilt_tool_records,
+};
 use ct_reconstruction::combine::{LoadJob, LoadedStack};
+use ct_reconstruction::rebin::rebinned_size;
 use egui::{Color32, RichText};
 use sha2::{Digest, Sha256};
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::mpsc::Receiver;
 use std::time::Duration;
+
+/// The standalone tilt & center-of-rotation tool (same binary the main
+/// application launches from its pre-processing screen).
+pub const TILT_COR_BIN: &str =
+    "/SNS/VENUS/shared/software/git/rust_tilt_center_of_rotation/target/release/tilt_center_of_rotation";
+
+/// The checkpoint's center of rotation, or the detector center when it
+/// carries none (what the seeding rule falls back to).
+fn checkpoint_center(stack: &LoadedStack, width: usize) -> (f64, bool) {
+    match stack.center_of_rotation {
+        Some(c) => (c, true),
+        None => (center_from_offset(0.0, width), false),
+    }
+}
+
+/// The tilt corrections recorded in the checkpoint, one line each: the
+/// in-pipeline step of the main application (`tilt_correction`) and the
+/// standalone tool's JSON records (`tilt_center_of_rotation`).
+fn tilt_summary_lines(stack: &LoadedStack) -> Vec<String> {
+    let mut lines = Vec::new();
+    if let Some((_, desc)) = stack
+        .metadata
+        .iter()
+        .find(|(name, _)| name == "tilt_correction")
+    {
+        // "tilt -2.0511 deg, axis shift 191 px, edge-padded (…)"
+        let mut words = desc.split_whitespace();
+        let deg = words.nth(1).and_then(|v| v.parse::<f64>().ok());
+        let shift = desc
+            .split("shift")
+            .nth(1)
+            .and_then(|rest| rest.split_whitespace().next())
+            .and_then(|v| v.parse::<i64>().ok());
+        lines.push(match (deg, shift) {
+            (Some(deg), Some(shift)) => format!(
+                "pre-processing step: tilt {deg:+.4}° corrected, axis shifted {shift} px"
+            ),
+            _ => format!("pre-processing step: {desc}"),
+        });
+    }
+    for record in tilt_tool_records(&stack.metadata) {
+        let doc: serde_json::Value = match serde_json::from_str(&record) {
+            Ok(doc) => doc,
+            Err(_) => continue,
+        };
+        let get = |key: &str| doc.get(key).and_then(|v| v.as_f64());
+        let text = |key: &str| doc.get(key).and_then(|v| v.as_str()).unwrap_or("");
+        lines.push(format!(
+            "tilt & center-of-rotation tool: tilt {:+.4}° corrected, center of rotation              {:.2} px ({}{}{})",
+            get("corrected_tilt_deg").unwrap_or(0.0),
+            get("center_of_rotation").unwrap_or(0.0),
+            text("method"),
+            if text("date").is_empty() { "" } else { ", " },
+            text("date"),
+        ));
+    }
+    lines
+}
 
 /// SHA-256 of the advanced-parameters password (same gate as the marimo
 /// notebook and the main application's admin section).
@@ -42,6 +105,9 @@ struct HistoryEntry {
     params: MbirjaxParams,
     top_slice: usize,
     bottom_slice: usize,
+    /// n×n rebin the test data was reconstructed at (1 = the checkpoint's
+    /// own resolution).
+    test_rebin: usize,
     seconds: f64,
     /// Downsampled copies of the two reconstructed slices, kept so past runs
     /// can be previewed side by side when choosing the parameters.
@@ -71,15 +137,30 @@ pub struct OptimizerApp {
     advanced_error: Option<String>,
 
     // Test reconstruction.
+    /// n×n rebin of the test bands before reconstructing them (1 = none):
+    /// a shortcut for the test only — the saved parameters keep the
+    /// checkpoint's pixel units.
+    test_rebin: usize,
     recon_job: Option<ReconJob>,
     /// Last result: (height, width, top slice, bottom slice, seconds).
     result: Option<(usize, usize, Vec<f32>, Vec<f32>, f64)>,
+    /// The rebin factor of the last result (for its caption).
+    result_rebin: usize,
     result_tex: Option<(egui::TextureHandle, egui::TextureHandle)>,
     recon_error: Option<String>,
     history: Vec<HistoryEntry>,
 
     // Saving into the HDF5.
     save_status: Option<Result<String, String>>,
+
+    // The standalone tilt & center-of-rotation tool, run on the checkpoint
+    // itself; when it applied a correction the file is reloaded.
+    tilt_tool_job: Option<Receiver<Result<(), String>>>,
+    tilt_tool_note: Option<Result<String, String>>,
+    /// Set while reloading after the tool changed the file: seed the
+    /// detector-channel offset from the new center of rotation instead of
+    /// the (now stale) saved parameters.
+    reseed_offset_on_load: bool,
 
     /// Imaging team + tool logos, loaded into textures on the first frame.
     logo_tex: Option<Vec<egui::TextureHandle>>,
@@ -102,12 +183,17 @@ impl OptimizerApp {
             advanced_unlocked: false,
             advanced_password: String::new(),
             advanced_error: None,
+            test_rebin: 1,
             recon_job: None,
             result: None,
+            result_rebin: 1,
             result_tex: None,
             recon_error: None,
             history: Vec::new(),
             save_status: None,
+            tilt_tool_job: None,
+            tilt_tool_note: None,
+            reseed_offset_on_load: false,
             logo_tex: None,
             status: "Open a pre-processed checkpoint HDF5 to begin.".to_owned(),
         };
@@ -138,15 +224,30 @@ impl OptimizerApp {
             .metadata
             .iter()
             .any(|(name, _)| name == "mbirjax_config");
+        let (w, views) = stack
+            .sample
+            .first()
+            .map(|p| (p.width, stack.sample.len()))
+            .unwrap_or((0, 0));
+        self.test_rebin = crate::recon::default_test_rebin(w, h, views);
+        let mut note = if restored {
+            " — saved MBIRJAX parameters restored"
+        } else {
+            ""
+        }
+        .to_owned();
+        if std::mem::take(&mut self.reseed_offset_on_load)
+            && let Some(cor) = stack.center_of_rotation
+        {
+            self.params.det_channel_offset = offset_from_center(cor, w);
+            note = format!(
+                " — center of rotation offset re-seeded from the corrected file                  ({cor:.2} px); save the parameters to keep it"
+            );
+        }
         self.status = format!(
-            "{} — {} projections{}",
+            "{} — {} projections{note}",
             stack.path.display(),
             stack.sample.len(),
-            if restored {
-                " — saved MBIRJAX parameters restored"
-            } else {
-                ""
-            }
         );
         self.stack = Some(Arc::new(stack));
     }
@@ -229,9 +330,12 @@ impl OptimizerApp {
         if let Some((_, tex)) = &self.preview_tex {
             let size = tex.size_vec2();
             let scale = (420.0 / size.x.max(size.y)).min(2.0);
-            let response =
-                ui.add(egui::Image::from_texture(tex).fit_to_exact_size(size * scale));
-            let rect = response.rect;
+            // Allocate exactly the drawn size: inside `ui.columns` (a
+            // justified layout) an Image widget's response rect spans the
+            // whole column, which would put the overlay lines off the image.
+            let (rect, _response) =
+                ui.allocate_exact_size(size * scale, egui::Sense::hover());
+            egui::Image::from_texture(tex).paint_at(ui, rect);
             let painter = ui.painter_at(rect);
             let y_of =
                 |row: usize| rect.top() + (row as f32 / h as f32) * rect.height();
@@ -247,16 +351,285 @@ impl OptimizerApp {
                     egui::Stroke::new(1.5, color),
                 );
             }
-            let _ = w;
+            // The center of rotation: the checkpoint's (dashed orange) and,
+            // when the offset was changed here, the current one (solid green).
+            let x_of = |col: f64| rect.left() + ((col + 0.5) / w as f64) as f32 * rect.width();
+            let (file_cor, _) = checkpoint_center(&stack, w);
+            let current_cor = center_from_offset(self.params.det_channel_offset, w);
+            let moved = (current_cor - file_cor).abs() > 1e-6;
+            painter.add(egui::Shape::dashed_line(
+                &[
+                    egui::pos2(x_of(file_cor), rect.top()),
+                    egui::pos2(x_of(file_cor), rect.bottom()),
+                ],
+                egui::Stroke::new(1.5, Color32::from_rgb(255, 170, 40)),
+                6.0,
+                4.0,
+            ));
+            if moved {
+                painter.line_segment(
+                    [
+                        egui::pos2(x_of(current_cor), rect.top()),
+                        egui::pos2(x_of(current_cor), rect.bottom()),
+                    ],
+                    egui::Stroke::new(1.5, Color32::from_rgb(120, 230, 120)),
+                );
+            }
         }
+        self.center_readout(ui, &stack, w);
+        ui.add_space(4.0);
+
+        // The resolution the test runs at.
+        let max_rebin = max_test_rebin(h);
+        self.test_rebin = self.test_rebin.clamp(1, max_rebin);
+        let rebin_label = |n: usize| -> String {
+            let (rw, rh) = rebinned_size(w, h, n);
+            if n <= 1 {
+                format!("full resolution ({w} px wide)")
+            } else {
+                format!("{n}x{n} rebinned ({rw}x{rh} px)")
+            }
+        };
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("Test data:").strong());
+            egui::ComboBox::from_id_salt("test_rebin")
+                .selected_text(rebin_label(self.test_rebin))
+                .show_ui(ui, |ui| {
+                    for f in TEST_REBIN_FACTORS.iter().copied().filter(|f| *f <= max_rebin) {
+                        ui.selectable_value(&mut self.test_rebin, f, rebin_label(f));
+                    }
+                })
+                .response
+                .on_hover_text(
+                    "reconstruct the test slices from n×n block-averaged projections: \
+                     smaller sinograms reconstruct much faster (and fit the GPU when \
+                     the full width does not), at a coarser resolution. A shortcut \
+                     for the test only — the parameters are saved in the checkpoint's \
+                     pixel units and the full reconstruction runs on the checkpoint \
+                     as is.",
+                );
+            let (rw, _) = rebinned_size(w, h, self.test_rebin);
+            match test_band_fits(rw, n) {
+                Some(true) => {
+                    ui.label(RichText::new("✔ fits one GPU").weak().size(11.0));
+                }
+                Some(false) => {
+                    ui.colored_label(
+                        ui.visuals().warn_fg_color,
+                        format!(
+                            "⚠ a {BAND}-slice band {rw} px wide does not fit one GPU — \
+                             choose a larger rebin"
+                        ),
+                    );
+                }
+                None => {}
+            }
+        });
         ui.label(
-            RichText::new(
-                "the test reconstruction runs on the two marked slices only (a 4-slice \
-                 band around each)",
-            )
+            RichText::new(format!(
+                "the test reconstruction runs on the two marked slices only (a {BAND}-slice \
+                 band around each{})",
+                if self.test_rebin > 1 {
+                    format!(", {0}x{0} rebinned first", self.test_rebin)
+                } else {
+                    String::new()
+                }
+            ))
             .weak()
             .size(11.0),
         );
+
+        ui.add_space(8.0);
+        self.geometry_panel(ui, &stack);
+    }
+
+    /// The center-of-rotation readout under the projection: the value the
+    /// current offset stands for, and where it moved from when it differs
+    /// from the checkpoint's.
+    fn center_readout(&self, ui: &mut egui::Ui, stack: &LoadedStack, w: usize) {
+        let (file_cor, from_file) = checkpoint_center(stack, w);
+        let current_cor = center_from_offset(self.params.det_channel_offset, w);
+        let moved = (current_cor - file_cor).abs() > 1e-6;
+        let file_origin = if from_file {
+            "saved in the checkpoint"
+        } else {
+            "detector center — the checkpoint carries none"
+        };
+        if moved {
+            ui.horizontal_wrapped(|ui| {
+                ui.label(RichText::new("Center of rotation:").strong());
+                ui.colored_label(
+                    Color32::from_rgb(120, 230, 120),
+                    format!("{current_cor:.2} px (current, solid green)"),
+                );
+                ui.label(RichText::new(format!(
+                    "— moved {:+.2} px from",
+                    current_cor - file_cor
+                )));
+                ui.colored_label(
+                    Color32::from_rgb(255, 170, 40),
+                    format!("{file_cor:.2} px ({file_origin}, dashed)"),
+                );
+            });
+        } else {
+            ui.horizontal_wrapped(|ui| {
+                ui.label(RichText::new("Center of rotation:").strong());
+                ui.colored_label(
+                    Color32::from_rgb(255, 170, 40),
+                    format!("{file_cor:.2} px ({file_origin}, dashed line)"),
+                );
+            });
+        }
+        ui.label(
+            RichText::new(format!(
+                "offset from the detector center ({} px): {:+.2} px — adjustable in the \
+                 Advanced section",
+                w / 2,
+                self.params.det_channel_offset
+            ))
+            .weak()
+            .size(11.0),
+        );
+    }
+
+    /// What the checkpoint records about its geometry (tilt corrections,
+    /// pre-processing rebin), and the launcher of the standalone tilt &
+    /// center-of-rotation tool.
+    fn geometry_panel(&mut self, ui: &mut egui::Ui, stack: &Arc<LoadedStack>) {
+        ui.label(RichText::new("Tilt correction").strong());
+        let lines = tilt_summary_lines(stack);
+        if lines.is_empty() {
+            ui.label(
+                RichText::new("none recorded in this checkpoint")
+                    .weak()
+                    .size(12.0),
+            );
+        }
+        for line in &lines {
+            ui.label(RichText::new(format!("✔ {line}")).size(12.0));
+        }
+        if let Some((_, desc)) = stack.metadata.iter().find(|(name, _)| name == "rebin") {
+            ui.label(
+                RichText::new(format!("pre-processing rebin: {desc}"))
+                    .weak()
+                    .size(12.0),
+            );
+        }
+        ui.add_space(4.0);
+        let tool_open = self.tilt_tool_job.is_some();
+        let busy = tool_open || self.recon_job.is_some();
+        if ui
+            .add_enabled(
+                !busy,
+                egui::Button::new("🎯 Open the tilt & center-of-rotation tool"),
+            )
+            .on_hover_text(
+                "the standalone tool with the more robust estimators (sub-pixel \
+                 0°/180° registration, all-pairs consensus, gridrec test slices). \
+                 It opens this checkpoint directly: applying & saving there \
+                 rewrites its projections and center of rotation, and this window \
+                 reloads the file when the tool closes.",
+            )
+            .clicked()
+        {
+            let path = stack.path.clone();
+            let (tx, rx) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let result = std::process::Command::new(TILT_COR_BIN)
+                    .arg(&path)
+                    .arg("--called-from-app")
+                    .output();
+                let _ = tx.send(match result {
+                    Err(e) => Err(format!("cannot launch {TILT_COR_BIN}: {e}")),
+                    Ok(out) if !out.status.success() => Err(format!(
+                        "the tilt & center-of-rotation tool failed ({}): {}",
+                        out.status,
+                        String::from_utf8_lossy(&out.stderr).trim()
+                    )),
+                    Ok(_) => Ok(()),
+                });
+            });
+            self.tilt_tool_job = Some(rx);
+            self.tilt_tool_note = None;
+            self.status = "the tilt & center-of-rotation tool is open".to_owned();
+        }
+        if tool_open {
+            ui.horizontal(|ui| {
+                ui.spinner();
+                ui.label(
+                    RichText::new(
+                        "the tool is open — estimate, apply & save there, then close it \
+                         to come back",
+                    )
+                    .size(12.0),
+                );
+            });
+        }
+        match &self.tilt_tool_note {
+            Some(Ok(msg)) => {
+                let ok_color = if ui.visuals().dark_mode {
+                    Color32::from_rgb(120, 200, 120)
+                } else {
+                    Color32::from_rgb(27, 118, 51)
+                };
+                ui.colored_label(ok_color, msg);
+            }
+            Some(Err(e)) => {
+                ui.colored_label(ui.visuals().error_fg_color, e);
+            }
+            None => {}
+        }
+    }
+
+    /// Fold a finished tilt-tool session in: when the checkpoint gained a
+    /// correction record, reload it (re-seeding the offset from the new
+    /// center of rotation); otherwise nothing changed.
+    fn poll_tilt_tool(&mut self) {
+        let Some(rx) = &self.tilt_tool_job else { return };
+        let outcome = match rx.try_recv() {
+            Ok(outcome) => outcome,
+            Err(_) => return,
+        };
+        self.tilt_tool_job = None;
+        let Some(stack) = self.stack.clone() else { return };
+        match outcome {
+            Err(e) => {
+                self.tilt_tool_note = Some(Err(e));
+                self.status = "the tilt & center-of-rotation tool failed".to_owned();
+            }
+            Ok(()) => match checkpoint_geometry(&stack.path) {
+                Err(e) => {
+                    self.tilt_tool_note = Some(Err(format!(
+                        "cannot re-read the checkpoint after the tool closed: {e}"
+                    )));
+                }
+                Ok((cor, records)) => {
+                    let before = tilt_tool_records(&stack.metadata).len();
+                    if records.len() > before {
+                        let last = records.last().cloned().unwrap_or_default();
+                        let doc: serde_json::Value =
+                            serde_json::from_str(&last).unwrap_or_default();
+                        let tilt = doc
+                            .get("corrected_tilt_deg")
+                            .and_then(|v| v.as_f64())
+                            .unwrap_or(0.0);
+                        self.tilt_tool_note = Some(Ok(format!(
+                            "applied: tilt {tilt:+.4}° corrected, center of rotation {:.2} px \
+                             — the checkpoint was reloaded",
+                            cor.unwrap_or(f64::NAN)
+                        )));
+                        self.reseed_offset_on_load = true;
+                        self.start_load(stack.path.clone());
+                    } else {
+                        self.tilt_tool_note =
+                            Some(Ok("closed without applying a correction".to_owned()));
+                        self.status = "the tilt & center-of-rotation tool closed — \
+                                       nothing changed"
+                            .to_owned();
+                    }
+                }
+            },
+        }
     }
 
     fn params_panel(&mut self, ui: &mut egui::Ui) {
@@ -331,6 +704,11 @@ impl OptimizerApp {
                     .and_then(|s| s.sample.first())
                     .map(|p| p.width as f64)
                     .unwrap_or(512.0);
+                let (file_cor, w) = self
+                    .stack
+                    .as_ref()
+                    .and_then(|s| s.sample.first().map(|p| (checkpoint_center(s, p.width).0, p.width)))
+                    .unwrap_or((width / 2.0, width as usize));
                 ui.horizontal(|ui| {
                     ui.label("center of rotation offset from center:");
                     ui.add(
@@ -340,8 +718,27 @@ impl OptimizerApp {
                     )
                     .on_hover_text(
                         "offset of the center of rotation from the center of the detector \
-                         image, in pixels; positive values shift it to the right",
+                         image, in pixels; positive values shift it to the right — the \
+                         green line on the projection follows it",
                     );
+                    ui.label(
+                        RichText::new(format!(
+                            "= center of rotation {:.2} px",
+                            center_from_offset(self.params.det_channel_offset, w)
+                        ))
+                        .weak(),
+                    );
+                    let file_offset = offset_from_center(file_cor, w);
+                    if (self.params.det_channel_offset - file_offset).abs() > 1e-6
+                        && ui
+                            .button("↺ checkpoint value")
+                            .on_hover_text(format!(
+                                "back to the checkpoint's center of rotation ({file_cor:.2} px)"
+                            ))
+                            .clicked()
+                    {
+                        self.params.det_channel_offset = file_offset;
+                    }
                 });
             });
     }
@@ -356,6 +753,7 @@ impl OptimizerApp {
                         params: self.params,
                         top_slice: self.top_slice,
                         bottom_slice: self.bottom_slice,
+                        test_rebin: self.result_rebin,
                         seconds,
                         thumb_size: (tw, th),
                         top_thumb,
@@ -379,14 +777,22 @@ impl OptimizerApp {
                 None => {
                     ui.horizontal(|ui| {
                         ui.spinner();
-                        ui.label("mbirjax is reconstructing the two test slices…");
+                        ui.label(if self.result_rebin > 1 {
+                            format!(
+                                "mbirjax is reconstructing the two test slices ({0}x{0} \
+                                 rebinned)…",
+                                self.result_rebin
+                            )
+                        } else {
+                            "mbirjax is reconstructing the two test slices…".to_owned()
+                        });
                     });
                     ctx.request_repaint_after(Duration::from_millis(300));
                 }
             }
         }
 
-        let busy = self.recon_job.is_some();
+        let busy = self.recon_job.is_some() || self.tilt_tool_job.is_some();
         ui.horizontal(|ui| {
             let evaluate = egui::Button::new(
                 RichText::new("▶ Evaluate the reconstruction of the selected slices")
@@ -403,11 +809,13 @@ impl OptimizerApp {
                 let stack = self.stack.clone().expect("checked above");
                 self.recon_error = None;
                 self.status = "Running mbirjax…".to_owned();
+                self.result_rebin = self.test_rebin;
                 self.recon_job = Some(ReconJob::start(
                     stack,
                     self.top_slice,
                     self.bottom_slice,
                     self.params,
+                    self.test_rebin,
                 ));
             }
         });
@@ -420,7 +828,12 @@ impl OptimizerApp {
         {
             ui.label(
                 RichText::new(format!(
-                    "reconstructed {rh}x{rw} slices in {seconds:.1} s — {}",
+                    "reconstructed {rh}x{rw} slices in {seconds:.1} s{} — {}",
+                    if self.result_rebin > 1 {
+                        format!(" from {0}x{0} rebinned data", self.result_rebin)
+                    } else {
+                        String::new()
+                    },
                     self.params.describe()
                 ))
                 .strong(),
@@ -474,7 +887,7 @@ impl OptimizerApp {
                         });
                         ui.horizontal(|ui| {
                             if ui.button("use").clicked() {
-                                restore = Some(entry.params);
+                                restore = Some((entry.params, entry.test_rebin));
                             }
                             for (tex, which) in
                                 [(&*top_tex, "top"), (&*bottom_tex, "bottom")]
@@ -497,19 +910,25 @@ impl OptimizerApp {
                             }
                             ui.label(
                                 RichText::new(format!(
-                                    "#{} — rows {}/{} — {} — {:.1} s",
+                                    "#{} — rows {}/{} — {}{} — {:.1} s",
                                     i + 1,
                                     entry.top_slice,
                                     entry.bottom_slice,
                                     entry.params.describe(),
+                                    if entry.test_rebin > 1 {
+                                        format!(", test rebin {0}x{0}", entry.test_rebin)
+                                    } else {
+                                        String::new()
+                                    },
                                     entry.seconds
                                 ))
                                 .size(12.0),
                             );
                         });
                     }
-                    if let Some(params) = restore {
+                    if let Some((params, rebin)) = restore {
                         self.params = params;
+                        self.test_rebin = rebin;
                     }
                 });
         }
@@ -537,6 +956,10 @@ impl eframe::App for OptimizerApp {
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
+        self.poll_tilt_tool();
+        if self.tilt_tool_job.is_some() {
+            ctx.request_repaint_after(Duration::from_millis(500));
+        }
         if let Some(job) = &mut self.load_job {
             match job.poll() {
                 Some(Ok(stack)) => {
@@ -592,7 +1015,8 @@ impl eframe::App for OptimizerApp {
         });
         if self.stack.is_some() {
             egui::Panel::bottom("actions").show(ui, |ui| {
-                let ready = self.recon_job.is_none();
+                // Not while the tilt tool may be rewriting the file.
+                let ready = self.recon_job.is_none() && self.tilt_tool_job.is_none();
                 ui.add_space(6.0);
                 ui.horizontal(|ui| {
                     let save = egui::Button::new(

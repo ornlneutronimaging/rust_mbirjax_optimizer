@@ -94,6 +94,18 @@ fn load_logo(ctx: &egui::Context, name: &str, bytes: &[u8]) -> Option<egui::Text
     Some(ctx.load_texture(name, color_image, egui::TextureOptions::LINEAR))
 }
 
+/// Drag speed for a value field: holding Shift while dragging (or using
+/// the arrow keys) moves the value 10× FASTER, as in Adobe's tools. egui's
+/// built-in shift behavior divides the speed by 10, so ×100 nets ×10 —
+/// the same convention as the tilt & center-of-rotation tool.
+fn drag_speed(ui: &egui::Ui, base: f64) -> f64 {
+    if ui.input(|i| i.modifiers.shift_only()) {
+        base * 100.0
+    } else {
+        base
+    }
+}
+
 fn password_matches(input: &str) -> bool {
     let digest = Sha256::digest(input.as_bytes());
     let hex: String = digest.iter().map(|b| format!("{b:02x}")).collect();
@@ -713,13 +725,14 @@ impl OptimizerApp {
                     ui.label("center of rotation offset from center:");
                     ui.add(
                         egui::DragValue::new(&mut self.params.det_channel_offset)
-                            .speed(0.01)
+                            .speed(drag_speed(ui, 0.01))
                             .range(-width / 2.0..=width / 2.0),
                     )
                     .on_hover_text(
                         "offset of the center of rotation from the center of the detector \
                          image, in pixels; positive values shift it to the right — the \
-                         green line on the projection follows it",
+                         green line on the projection follows it. Drag or use the arrow \
+                         keys; hold Shift to move 10× faster",
                     );
                     ui.label(
                         RichText::new(format!(

@@ -41,7 +41,8 @@ The projection view draws the **center of rotation**: the checkpoint's
 value as a dashed orange line and, once the detector channel offset is
 changed in the Advanced section, the current one as a solid green line,
 with a readout of both values and the move between them (`↺ checkpoint
-value` goes back). The detector channel offset defaults to
+value` goes back). Drag the offset field or use the arrow keys; holding
+Shift moves it 10× faster. The detector channel offset defaults to
 `-(width/2 - center_of_rotation)` from the checkpoint.
 
 Under the projection, **Tilt correction** lists what the checkpoint

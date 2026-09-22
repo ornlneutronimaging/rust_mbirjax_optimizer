@@ -2,9 +2,9 @@
 //! the real mbirjax of the `all_ct_reconstruction_development` pixi
 //! environment), and saving the parameters back into the checkpoint HDF5.
 
-use ct_reconstruction::combine::{LoadedStack, Projection};
-use ct_reconstruction::crop::{read_npy, write_npy};
-use ct_reconstruction::rebin::{rebin_center, rebin_projection, rebinned_size};
+use nectar::combine::{LoadedStack, Projection};
+use nectar::crop::{read_npy, write_npy};
+use nectar::rebin::{rebin_center, rebin_projection, rebinned_size};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{Receiver, channel};
 use std::sync::{Arc, Mutex};
@@ -62,8 +62,8 @@ pub fn max_test_rebin(height: usize) -> usize {
 /// one of the machine's GPUs? `None` when no GPU can be probed (jax would
 /// run on the CPU and memory is not the constraint).
 pub fn test_band_fits(width: usize, views: usize) -> Option<bool> {
-    let (_, min_mib) = ct_reconstruction::app::gpu_inventory()?;
-    let s = ct_reconstruction::app::mbirjax_max_slices(width.max(1), views.max(1), 1, min_mib);
+    let (_, min_mib) = nectar::app::gpu_inventory()?;
+    let s = nectar::app::mbirjax_max_slices(width.max(1), views.max(1), 1, min_mib);
     Some(s.is_finite() && s >= BAND as f64)
 }
 

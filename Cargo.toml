@@ -5,14 +5,14 @@ edition = "2024"
 description = "Tune MBIRJAX reconstruction parameters on two test slices of a pre-processed CT stack, then save them into the checkpoint HDF5"
 
 [dependencies]
-ct_reconstruction = { path = "../rust_ct_reconstruction" }
+nectar = { path = "../rust_ct_reconstruction" }
 eframe = "0.35"
 egui = "0.35"
 hdf5-metno = "0.10"
 image = { version = "0.25", default-features = false, features = ["png"] }
 # gtk3 backend (not the default xdg-portal one): the portal ignores
 # set_directory, so "start browsing here" would not work. Also matches the
-# feature ct_reconstruction (a path dependency) now requires of rfd.
+# feature nectar (a path dependency) now requires of rfd.
 rfd = { version = "0.17", default-features = false, features = ["gtk3"] }
 serde_json = "1.0"
 sha2 = "0.10"

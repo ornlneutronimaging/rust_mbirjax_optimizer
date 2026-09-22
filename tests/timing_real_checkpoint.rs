@@ -4,7 +4,7 @@
 //!
 //!   MBIRJAX_TIMING_H5=/path/to/checkpoint.h5 cargo test --release --test timing_real_checkpoint -- --ignored --nocapture
 
-use ct_reconstruction::combine::load_hdf5;
+use nectar::combine::load_hdf5;
 use mbirjax_optimizer::recon::{MbirjaxParams, ReconJob};
 use std::path::Path;
 use std::sync::Arc;

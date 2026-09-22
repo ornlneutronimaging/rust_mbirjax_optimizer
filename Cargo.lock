@@ -824,24 +824,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "ct_reconstruction"
-version = "0.1.0"
-dependencies = [
- "chrono",
- "detector_orientation",
- "eframe",
- "egui",
- "egui_plot",
- "hdf5-metno",
- "image",
- "rayon",
- "rfd",
- "serde_json",
- "sha2",
- "tiff",
-]
-
-[[package]]
 name = "cursor-icon"
 version = "1.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2114,11 +2096,11 @@ dependencies = [
 name = "mbirjax_optimizer"
 version = "0.1.0"
 dependencies = [
- "ct_reconstruction",
  "eframe",
  "egui",
  "hdf5-metno",
  "image",
+ "nectar",
  "rfd",
  "serde_json",
  "sha2",
@@ -2237,6 +2219,24 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ee6cda3051665f1fb8d9e08fc35c96d5a244fb1be711a03b71118828afc9a873"
 dependencies = [
  "jni-sys 0.3.1",
+]
+
+[[package]]
+name = "nectar"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "detector_orientation",
+ "eframe",
+ "egui",
+ "egui_plot",
+ "hdf5-metno",
+ "image",
+ "rayon",
+ "rfd",
+ "serde_json",
+ "sha2",
+ "tiff",
 ]
 
 [[package]]
